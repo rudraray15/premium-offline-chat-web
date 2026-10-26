@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 
+const STORAGE_KEY = 'lumachat_secure_state_v1';
+const APP_SECRET = 'lumachat-premium-2026-secure-key';
+
 const initialContacts = [
   { id: 'c1', name: 'Alicia', phone: '+1 415 203 7462', status: 'Online', avatar: 'A' },
   { id: 'c2', name: 'Nora', phone: '+44 20 7946 0958', status: 'Offline', avatar: 'N' },
@@ -8,7 +11,7 @@ const initialContacts = [
 
 const initialMessages = {
   c1: [
-    { id: 'm1', sender: 'them', text: 'Hey! Your offline draft is ready.', time: Date.now() - 60000 },
+    { id: 'm1', sender: 'them', text: 'Hey! Your secure draft is ready.', time: Date.now() - 60000 },
     { id: 'm2', sender: 'me', text: 'Perfect. I will review it now.', time: Date.now() - 30000 },
   ],
   c2: [
@@ -19,7 +22,75 @@ const initialMessages = {
   ],
 };
 
-const storageKey = 'lumachat-web-state';
+function toBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  bytes.forEach((b) => {
+    binary += String.fromCharCode(b);
+  });
+  return window.btoa(binary);
+}
+
+function fromBase64(value) {
+  const binary = window.atob(value);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return bytes;
+}
+
+async function deriveKey(phone) {
+  const salt = new TextEncoder().encode(APP_SECRET);
+  const seed = new TextEncoder().encode(phone || 'default-user');
+  const baseKey = await crypto.subtle.importKey('raw', seed, 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 120000, hash: 'SHA-256' },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encryptText(value, phone) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(phone);
+  const encoded = new TextEncoder().encode(value);
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+  return `${toBase64(iv)}.${toBase64(encrypted)}`;
+}
+
+async function decryptText(value, phone) {
+  if (!value || !value.includes('.')) return '';
+  const [ivText, dataText] = value.split('.');
+  const iv = fromBase64(ivText);
+  const data = fromBase64(dataText);
+  const key = await deriveKey(phone);
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+  return new TextDecoder().decode(decrypted);
+}
+
+async function readSecureState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const [phone, encrypted] = raw.split('::');
+    if (!phone || !encrypted) return null;
+    const parsed = JSON.parse(await decryptText(encrypted, phone));
+    return { phone, data: parsed };
+  } catch (error) {
+    console.warn('Secure read failed', error);
+    return null;
+  }
+}
+
+async function writeSecureState(data, phone) {
+  try {
+    const json = JSON.stringify(data);
+    const encrypted = await encryptText(json, phone);
+    localStorage.setItem(STORAGE_KEY, `${phone}::${encrypted}`);
+  } catch (error) {
+    console.warn('Secure save failed', error);
+  }
+}
 
 function formatTime(ts) {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -40,26 +111,39 @@ function App() {
   const [draft, setDraft] = useState('');
   const [newName, setNewName] = useState('');
   const [newPhone, setNewPhone] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(storageKey);
-      if (!saved) return;
-      const parsed = JSON.parse(saved);
-      if (parsed.phone) setPhone(parsed.phone);
-      if (parsed.loggedIn) setLoggedIn(parsed.loggedIn);
-      if (parsed.contacts?.length) setContacts(parsed.contacts);
-      if (parsed.selectedContactId) setSelectedContactId(parsed.selectedContactId);
-      if (parsed.messages) setMessages(parsed.messages);
-    } catch (error) {
-      console.log('Load failed', error);
-    }
+    const boot = async () => {
+      try {
+        const saved = await readSecureState();
+        if (saved?.data) {
+          setPhone(saved.phone);
+          setLoggedIn(Boolean(saved.data.loggedIn));
+          setContacts(saved.data.contacts || initialContacts);
+          setSelectedContactId(saved.data.selectedContactId || 'c1');
+          setMessages(saved.data.messages || initialMessages);
+        }
+      } catch (error) {
+        console.log('Boot failed', error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    boot();
   }, []);
 
   useEffect(() => {
-    const payload = { loggedIn, phone, contacts, selectedContactId, messages };
-    localStorage.setItem(storageKey, JSON.stringify(payload));
-  }, [loggedIn, phone, contacts, selectedContactId, messages]);
+    if (!phone || !loggedIn || isLoading) return;
+    const payload = {
+      loggedIn,
+      contacts,
+      selectedContactId,
+      messages,
+    };
+    writeSecureState(payload, phone);
+  }, [loggedIn, phone, contacts, selectedContactId, messages, isLoading]);
 
   const selectedContact = useMemo(
     () => contacts.find((c) => c.id === selectedContactId) || contacts[0],
@@ -99,7 +183,7 @@ function App() {
     setContacts((prev) => [contact, ...prev]);
     setMessages((prev) => ({
       ...prev,
-      [contact.id]: [{ id: createId('welcome'), sender: 'them', text: 'New contact added securely.', time: Date.now() }],
+      [contact.id]: [{ id: createId('welcome'), sender: 'them', text: 'New secure contact added.', time: Date.now() }],
     }));
     setSelectedContactId(contact.id);
     setNewName('');
@@ -129,20 +213,29 @@ function App() {
           {
             id: createId('reply'),
             sender: 'them',
-            text: 'Offline message synced successfully.',
+            text: 'Offline message encrypted and synced securely.',
             time: Date.now(),
           },
         ],
       }));
-    }, 900);
+    }, 700);
   };
 
   const logout = () => {
     setLoggedIn(false);
     setOtp('');
     setGeneratedOtp('');
-    setPhone('');
+    localStorage.removeItem(STORAGE_KEY);
   };
+
+  if (isLoading) {
+    return (
+      <div className="loading-shell">
+        <div className="loading-ring" />
+        <span>Preparing secure inbox...</span>
+      </div>
+    );
+  }
 
   if (!loggedIn) {
     return (
@@ -153,8 +246,11 @@ function App() {
             <span className="brand-name">LumaChat</span>
           </div>
 
-          <h1>Premium secure login</h1>
-          <p>Offline-first messaging with phone verification.</p>
+          <div className="hero-copy">
+            <span className="eyebrow">End-to-end private</span>
+            <h1>Premium secure login</h1>
+            <p>Encrypted offline-first messaging designed for privacy and speed.</p>
+          </div>
 
           <label>Phone number</label>
           <input
@@ -189,15 +285,19 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <small>Connected account</small>
+          <small>Encrypted account</small>
           <h3>{phone || '+1 000 000 0000'}</h3>
         </div>
-        <button className="ghost" onClick={logout}>Logout</button>
+        <div className="header-actions">
+          <span className="status-pill">Secure</span>
+          <button className="ghost" onClick={logout}>Logout</button>
+        </div>
       </header>
 
-      <div className="panel contact-panel">
+      <section className="panel contact-panel">
         <div className="panel-head">
           <h2>Contacts</h2>
+          <span className="mini-badge">{contacts.length}</span>
         </div>
 
         <div className="contact-form">
@@ -221,9 +321,9 @@ function App() {
             </button>
           ))}
         </div>
-      </div>
+      </section>
 
-      <div className="panel chat-panel">
+      <section className="panel chat-panel">
         <div className="chat-header">
           <div className="chat-user">
             <div className="avatar large">{selectedContact?.avatar}</div>
@@ -232,7 +332,10 @@ function App() {
               <small>{selectedContact?.phone}</small>
             </div>
           </div>
-          <span className="online-dot" />
+          <div className="chat-status">
+            <span className="online-dot" />
+            <span>Online</span>
+          </div>
         </div>
 
         <div className="messages">
@@ -250,9 +353,12 @@ function App() {
           <input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Type a secure message..." />
           <button onClick={sendMessage}>Send</button>
         </div>
-      </div>
+      </section>
     </div>
   );
 }
 
 export default App;
+
+
+
